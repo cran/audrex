@@ -2,3 +2,10 @@
 
 * Added a `NEWS.md` file to track changes to the package.
 
+# audrex 1.0.1
+
+* Added minmax normalization and removed shift feature
+* Expanded the available statistics both in predictions and pred_stats
+* Added cross-validation through expanding windows
+* Added two datasets
+* Added link to article in Rpubs
