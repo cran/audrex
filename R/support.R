@@ -1,482 +1,506 @@
 #' support functions for audrex
 #'
+#' @param predictors A data frame with predictors on columns.
+#' @param target A numeric vector with target variable.
+#' @param booster String. Optimization methods available are: "gbtree", "gblinear". Default: "gbtree".
+#' @param max_depth Positive integer. Look to xgboost documentation for description. A vector with one or two positive integer for the search boundaries. The default value (NULL) sets automatically the values in c(1, 8).
+#' @param eta Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric between (0, 1] for the search boundaries. The default value (NULL) sets automatically the values in c(0, 1).
+#' @param gamma Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0, 100).
+#' @param min_child_weight Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0, 100).
+#' @param subsample Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric between (0, 1] for the search boundaries. The default value (NULL) sets automatically the values in c(0, 1).
+#' @param colsample_bytree Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric between (0, 1] for the search boundaries. The default value (NULL) sets automatically the values in c(0, 1).
+#' @param lambda Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0, 100).
+#' @param alpha Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0, 100).
+#' @param n_windows Positive integer. Number of (expanding) windows for cross-validation. Default: 3.
+#' @param patience Positive numeric. Percentage of waiting rounds without improvement before xgboost stops. Default: 0.1
+#' @param nrounds Positive numeric. Number of round for the extreme boosting machine. Look to xgboost for description. Default: 100.
+#'
 #' @author Giancarlo Vercellino \email{giancarlo.vercellino@gmail.com}
 #'
 #' @importFrom scales number
-#' @importFrom narray split
-#' @importFrom stats lm median na.omit quantile predict density
+#' @importFrom stats lm quantile predict ecdf runif sd weighted.mean
 #' @importFrom utils head tail
-#' @importFrom readr parse_number
-#' @importFrom lubridate seconds_to_period is.Date as.duration
 #' @importFrom modeest mlv1
 #' @importFrom moments skewness kurtosis
+#' @importFrom parallel detectCores
+#' @importFrom narray split
+#' @importFrom rBayesianOptimization BayesianOptimization
 #' @import purrr
-#' @import imputeTS
-#' @import abind
 #' @import xgboost
 #' @import ggplot2
-#' @import tictoc
 #' @import stringr
+#' @import Metrics
 
-globalVariables(c("x_all", "y_all"))
 
-reframe<-function(data, length)
+####
+engine <- function(predictors, target, booster, max_depth, eta, gamma, min_child_weight, subsample, colsample_bytree, lambda, alpha, n_windows, patience, nrounds)
 {
-  slice_list <- narray::split(data, along=2)
-  reframed <- abind(map(slice_list, ~ t(apply(embed(.x, dimension=length), 1, rev))), along=3)
-  return(reframed)
-}
+  nobs <- nrow(predictors)
+  df <- data.frame(target, predictors)
 
-recursive_diff <- function(vector, deriv)
-{
-  head_value <- vector("numeric", deriv)
-  tail_value <- vector("numeric", deriv)
-  if(deriv==0){vector; head_value <- NULL; tail_value <- NULL}
-  if(deriv > 0){for(i in 1:deriv){head_value[i] <- head(vector, 1); tail_value[i] <- tail(vector, 1); vector <- diff(vector)}}
-  outcome <- list(vector, head_value, tail_value)
-  return(outcome)
-}
+  raw_collection <- list()
+  test_collection <- list()
 
-invdiff <- function(vector, heads)
-{
-  if(is.null(heads)){return(vector)}
-  if(!is.null(heads)){
-    for(d in length(heads):1)
-    {vector <- cumsum(c(heads[d], vector))}}
-  return(vector)
-}
+  w_index <- rep(1:(n_windows + 1), each = nobs/(n_windows + 1))
+  w_index <- c(rep(1, nobs%%(n_windows + 1)), w_index)
+  if(booster == "gbtree"){params <- list(booster = booster, max_depth = max_depth, eta = eta, gamma = gamma, min_child_weight = min_child_weight, subsample = subsample, colsample_bytree  = colsample_bytree, nthread = detectCores() - 1, objective = "reg:squarederror")}
+  if(booster == "gblinear"){params <- list(booster = booster, eta = eta, lambda = lambda, alpha = alpha, nthread = detectCores() - 1, objective = "reg:squarederror")}
 
-eval_metrics <- function(actual, predicted)
-{
-  actual <- unlist(actual)
-  predicted <- unlist(predicted)
-  if(length(actual) != length(predicted)){stop("different lengths")}
-
-  rmse <- sqrt(mean((actual - predicted)^2, na.rm = TRUE))
-  mae <- mean(abs(actual - predicted), na.rm = TRUE)
-  mdae <- median(abs(actual - predicted), na.rm = TRUE)
-  mpe <- mean((actual - predicted)/actual, na.rm = TRUE)
-  mape <- mean(abs(actual - predicted)/abs(actual), na.rm = TRUE)
-  smape <- mean(abs(actual - predicted)/mean(c(abs(actual), abs(predicted)), na.rm = TRUE), na.rm = TRUE)
-
-  metrics <- round(c(rmse = rmse, mae = mae, mdae = mdae, mpe = mpe, mape = mape, smape = smape), 4)
-  return(metrics)
-}
-
-minmax <- function(data, params = NULL, inverse = FALSE, by_col = FALSE)
-{
-  mm_norm <- function(x){(x - min(x, na.rm = TRUE))/(diff(range(x, na.rm = TRUE)))}
-  inv_mm_norm <- function(x, range){x * diff(range) + min(range)}
-
-  if(by_col == FALSE)
+  for(w in 1:n_windows)
   {
-    if(inverse == FALSE & is.null(params))
-    {
-      params <- range(data)
-      transformed <- mm_norm(data)
-      outcome <- list(params = params, transformed = transformed)
-    }
+    train_set <- df[w_index <= w,, drop = FALSE]
+    test_set <- df[w_index == w + 1,, drop = FALSE]
+    dtrain <- xgb.DMatrix(as.matrix(train_set[, -1]), label = as.matrix(train_set[, 1]))
+    dtest <- xgb.DMatrix(as.matrix(test_set[, -1]), label = as.matrix(test_set[, 1]))
+    watchlist <- list(train = dtrain, eval = dtest)
 
-    if(inverse == TRUE & !is.null(params))
-    {
-      inv_transformed <- inv_mm_norm(data, params)
-      outcome <- list(inv_transformed = inv_transformed)
-    }
+    if(is.numeric(patience)){esr <- patience * nrounds}
+    if(is.integer(patience)){esr <- patience}
+
+    model <- xgb.train(params, dtrain, nrounds = nrounds, watchlist, verbose = 0, early_stopping_rounds = patience * 1000)
+
+    train_predictions <- predict(model, as.matrix(train_set[,-1]))
+    fix_index <- (is.finite(train_predictions) & train_predictions != 0) & (is.finite(train_set[,1]) & train_set[,1] != 0)
+    training_errors <- map_dbl(list(rmse, mae, mdae, mape, mase, rae, rse, rrse), ~ .x(train_set[,1][fix_index], train_predictions[fix_index]))
+    test_predictions <- predict(model, as.matrix(test_set[,-1]))
+    fix_index <- (is.finite(test_predictions) & test_predictions != 0) & (is.finite(test_set[,1]) & test_set[,1] != 0)
+    testing_errors <- map_dbl(list(rmse, mae, mdae, mape, mase, rae, rse, rrse), ~ .x(test_set[,1][fix_index], test_predictions[fix_index]))
+
+    raw_collection[[w]] <- test_set[,1] - test_predictions
+
+    errors <- rbind(training_errors, testing_errors)
+    rownames(errors) <- c("training", "testing")
+    colnames(errors) <- c("rmse", "mae", "mdae", "mape", "mase", "rae", "rse", "rrse")
+
+    test_collection[[w]] <- errors
   }
 
-  if(by_col == TRUE)
-  {
+  raw_error <- unlist(raw_collection)
+  errors <- Reduce("+", test_collection)/n_windows
+  model <- xgboost(data = as.matrix(df[,-1]), label = as.matrix(df[,1]), params = params, nrounds = nrounds, early_stopping_rounds = patience * 1000, verbose = 0)
 
-    if(inverse == FALSE & is.null(params))
-    {
-      if(is.matrix(data) || is.data.frame(data))
-      {
-        params <- apply(data, 2, range, na.rm = TRUE)
-        transformed <- apply(data, 2, mm_norm)
-      }
-
-      if(is.vector(data))
-      {
-        params <- matrix(range(data, na.rm = TRUE), ncol = 1)
-        transformed <- mm_norm(data)
-      }
-
-      outcome <- list(params = params, transformed = transformed)
-    }
-
-    if(inverse == TRUE & !is.null(params))
-    {
-
-      if(is.matrix(data) || is.data.frame(data))
-      {
-        inv_transformed <- mapply(function(x) inv_mm_norm(data[,x], params[,x]), x = 1:ncol(params))
-      }
-
-      if(is.vector(data))
-      {
-        inv_transformed <- inv_mm_norm(data, params)
-      }
-
-      outcome <- list(inv_transformed = inv_transformed)
-    }
-  }
+  outcome <- list(model = model, errors = errors, raw_error = raw_error)
 
   return(outcome)
 }
 
-sequential_kld <- function(matrix)
+##########
+sequencer <- function(seq_len, ts_set, target, deriv, ci = 0.8, min_set = 30, booster = "gbtree",
+                      max_depth = 4, eta = 1, gamma = 1, min_child_weight = 1, subsample = 0.5, colsample_bytree = 0.7, lambda = 1, alpha = 1,
+                      n_windows = 3, patience = 0.1, nrounds = 100, feat_name, dates = NULL)
 {
-  n <- nrow(matrix)
-  if(n == 1){return(c(NA, NA))}
-  dens <- apply(matrix, 1, function(x) tryCatch(density(x[is.finite(x)], from = min(x, na.rm = TRUE), to = max(x, na.rm = TRUE)), error = function(e) NA))
-  dens <- keep(dens, !is.na(dens))
+  all_positive_check <- all(target >= 0)
+  all_negative_check <- all(target <= 0)
 
-  backward <- dens[-n]
-  forward <- dens[-1]
+  diff_model <- recursive_diff(target, deriv)
+  target <- diff_model$vector
+  ts_set <- smart_tail(ts_set, - deriv)
 
-  norm_backward <- map(backward, ~ .x$y/sum(.x$y))
-  norm_forward <- map(forward, ~ .x$y/sum(.x$y))
+  sequence <- map(1:seq_len, ~ engine(head(ts_set, -.x), tail(target, - .x), booster, max_depth, eta, gamma, min_child_weight, subsample, colsample_bytree, lambda, alpha, n_windows, patience, nrounds))
+  models <- map(sequence, ~ .x$model)
+  raw_errors <- map(sequence, ~ .x$raw_error)
+  seq_errors <- Reduce("+", map(sequence, ~ .x$errors))/seq_len
+  sequence <- map_dbl(models, ~ predict(.x, as.matrix(tail(ts_set, 1))))
+  quants <- sort(unique(c((1-ci)/2, 0.25, 0.5, 0.75, ci+(1-ci)/2)))
+  error_integration <- as.data.frame(map2(sequence, raw_errors, ~ .x + sample(.y, size = 1000, replace = TRUE, prob = rep(1:n_windows, each = length(.y)/n_windows))))####SAMPLING BY WINDOWS WEIGHTS???
+  if(seq_len > 1){integrated <- t(apply(error_integration, 1, function(x) invdiff(x, diff_model$tail_value)))}
+  if(seq_len == 1){integrated <- matrix(apply(error_integration, 1, function(x) invdiff(x, diff_model$tail_value)), ncol = 1)}
+  if(all_positive_check){integrated[integrated < 0] <- 0}
+  if(all_negative_check){integrated[integrated > 0] <- 0}
+  qfun <- function(x) {c(min = min(x, na.rm = TRUE), quantile(x, quants, na.rm = TRUE), max = max(x, na.rm = TRUE), mean = mean(x, na.rm = TRUE), sd = sd(x, na.rm = TRUE), mode = suppressWarnings(mlv1(x, method = "shorth", na.rm = TRUE)), skewness = skewness(x, na.rm=TRUE), kurtosis = kurtosis(x, na.rm=TRUE))}
+  predicted <- t(round(apply(integrated, 2, qfun), 3))
+  if(is.null(dim(predicted))){predicted <- as.data.frame(matrix(predicted, 1)); colnames(predicted) <- c("min", paste0(quants * 100, "%"), "max", "mean", "sd", "mode", "skewness", "kurtosis")}
+  rownames(predicted) <- NULL
 
-  seq_kld <- map2_dbl(norm_forward, norm_backward, ~ sum(.x * log(.x/.y)))
-  finite_index <- is.finite(seq_kld)
-  if(all(finite_index == FALSE)){avg_seq_kld <- NA} else {avg_seq_kld <- round(mean(seq_kld[finite_index]), 3)}
+  avg_iqr_to_range <- round(mean((predicted[,"75%"] - predicted[,"25%"])/(predicted[,"max"] - predicted[,"min"])), 3)
+  last_to_first_iqr <- round((predicted[seq_len,"75%"] - predicted[seq_len,"25%"])/(predicted[1,"75%"] - predicted[1,"25%"]), 3)
+  iqr_stats <- c(avg_iqr_to_range, last_to_first_iqr)
+  names(iqr_stats) <- c("avg_iqr_to_range", "terminal_iqr_ratio")
 
-  norm_end_dens <-  tryCatch(dens[[n]]$y/sum(dens[[n]]$y), error = function(e) NA)
-  norm_init_dens <-  tryCatch(dens[[1]]$y/sum(dens[[1]]$y), error = function(e) NA)
+  avg_risk_ratio <- round(mean((predicted[,"max"] - predicted[,"50%"])/(predicted[,"50%"] - predicted[,"min"])), 3)
+  last_to_risk_ratio <- round(((predicted[seq_len,"max"] - predicted[seq_len,"50%"])/(predicted[seq_len,"50%"] - predicted[seq_len,"min"]))/((predicted[1,"max"] - predicted[1,"50%"])/(predicted[1,"50%"] - predicted[1,"min"])), 3)
+  risk_stats <- c(avg_risk_ratio, last_to_risk_ratio)
+  names(risk_stats) <- c("avg_risk_ratio", "terminal_risk_ratio")
 
-  if(any(is.na(norm_end_dens) | is.na(norm_init_dens))){end_to_end_kld <- NA} else
-  {
-    end_to_end_kld <- norm_end_dens* log(norm_end_dens/norm_init_dens)
-    finite_index <- is.finite(end_to_end_kld)
-    if(all(finite_index == FALSE)){end_to_end_kld <- NA} else {end_to_end_kld <- round(sum(end_to_end_kld[finite_index]), 3)}
+  div_stats <- sequential_divergence(integrated)
+  upp_stats <- upside_probability(integrated)
+
+  pred_stats <- round(c(iqr_stats, risk_stats, div_stats, upp_stats), 3)
+
+  n_obs <- nrow(ts_set)
+  target <- invdiff(target, diff_model$head_value)
+  if(is.null(dates)){hist_dates <- 1:length(target); forcat_dates <- (n_obs + 1):(n_obs + seq_len)}
+  if(!is.null(dates)){hist_dates <- tail(dates, length(target)); forcat_dates <- seq.Date(tail(dates, 1), tail(dates, 1) + seq_len * mean(diff(dates)), length.out = seq_len)}
+  x_lab <- paste0("Forecasting Horizon for sequence n = ", seq_len)
+  y_lab <- paste0("Forecasting Values for ", feat_name)
+
+  plot <- ts_graph(x_hist = hist_dates, y_hist = target, x_forcat = forcat_dates, y_forcat = predicted[, 4], lower = predicted[, 2], upper = predicted[, 6], forcat_band = "deepskyblue", forcat_line = "deepskyblue4",
+                   label_x = x_lab, label_y = y_lab)
+
+  outcome <- list(models = models, predicted = predicted, seq_errors = seq_errors, pred_stats = pred_stats, plot = plot)
+  return(outcome)
+}
+
+#######
+hood <- function(ts_set, seq_len, deriv, norm = TRUE, n_dim, ci = 0.8, min_set = 30, booster = "gbtree",
+                 max_depth = 4, eta = 1, gamma = 1, min_child_weight = 1, subsample = 0.5,
+                 colsample_bytree = 0.7, lambda = 1, alpha = 1, n_windows = 3, patience = 0.1, nrounds = 100, dates = NULL)
+{
+  targets <- split(ts_set, along = 2)
+  feat_names <- colnames(ts_set)
+
+  if(norm == TRUE){
+    ###minmax <- function(x){(x - min(x))/(diff(range(x)))}
+    ts_set <- as.data.frame(apply(ts_set, 2, function(x) optimized_yjt(x)$transformed))###NORMALIZATION
   }
 
-  kld_stats <- c(avg_seq_kld, end_to_end_kld)
+  n_feats <- ncol(ts_set)
 
-  return(kld_stats)
+  if(n_feats > 1 && n_dim < n_feats){
+    svd_model <- svd(ts_set)
+    ts_set <- as.data.frame(svd_model$u[, 1:n_dim] %*% diag(svd_model$d[1:n_dim], n_dim, n_dim))
+    colnames(ts_set) <- paste0("dim", 1:n_dim)}
+
+  models <- pmap(list(targets, deriv, feat_names), ~ sequencer(seq_len, ts_set, ..1, ..2, ci, min_set, booster, max_depth, eta, gamma, min_child_weight, subsample, colsample_bytree, lambda, alpha, n_windows, patience, nrounds, ..3, dates))
+  serie_errors <- map(models, ~ round(.x$seq_errors, 3))
+  max_train_error <- apply(Reduce(rbind, map(serie_errors, ~ .x[1,])), 2, max)
+  max_test_error <- apply(Reduce(rbind, map(serie_errors, ~ .x[2,])), 2, max)
+  joint_error <- round(rbind(max_train_error, max_test_error), 3)
+  rownames(joint_error) <- c("train", "test")
+  colnames(joint_error) <- paste0("max_", c("rmse", "mae", "mdae", "mape", "mase", "rae", "rse", "rrse"))
+  predictions <- map(models, ~ .x$predicted)
+
+  if(is.null(dates)){predictions <- map(predictions, ~ {rownames(.x) <- paste0("t", 1:seq_len); return(.x)})}
+  if(!is.null(dates)){
+    predicted_dates <- seq.Date(tail(dates, 1), tail(dates, 1) + seq_len * mean(diff(dates)), length.out = seq_len)
+    predictions <- map(predictions, ~ {.x <- as.data.frame(.x); rownames(.x) <- predicted_dates; return(.x)})}
+
+  plots <- map(models, ~ .x$plot)
+  pred_stats <- as.data.frame(map(models, ~ .x$pred_stats))
+
+  outcome <- list(predictions = predictions, joint_error = joint_error, serie_errors = serie_errors, pred_stats = pred_stats, plots = plots)
+
+  return(outcome)
 }
 
-upside_probability <- function(matrix)
-{
-  n <- nrow(matrix)
-  if(n == 1){return(c(NA, NA))}
-  growths <- matrix[-1,]/matrix[-n,] - 1
-  dens <- apply(growths, 1, function(x) tryCatch(density(x[is.finite(x)], from = min(x[is.finite(x)], na.rm = TRUE), to = max(x[is.finite(x)], na.rm = TRUE)), error = function(e) NA))
-  dens <- keep(dens, !is.na(dens))
-  avg_upp <- round(mean(map_dbl(dens, ~ sum(.x$y[.x$x>0])/sum(.x$y))), 3)
-  end_growth <- matrix[n,]/matrix[1,] - 1
-  end_to_end_dens <- tryCatch(density(end_growth[is.finite(end_growth)], from = min(end_growth[is.finite(end_growth)], na.rm = TRUE), to = max(end_growth[is.finite(end_growth)], na.rm = TRUE)), error = function(e) NA)
-  if(!anyNA(end_to_end_dens)){last_to_first_upp <- round(sum(end_to_end_dens$y[end_to_end_dens$x>0])/sum(end_to_end_dens$y), 3)}
-  if(anyNA(end_to_end_dens)){last_to_first_upp <- NA}
-  upp_stats <- c(avg_upp, last_to_first_upp)
-  return(upp_stats)
-}
 
+
+
+##############
 ts_graph <- function(x_hist, y_hist, x_forcat, y_forcat, lower = NULL, upper = NULL, line_size = 1.3, label_size = 11,
-                     forcat_band = "darkorange", forcat_line = "darkorange", hist_line = "gray43",
-                     label_x = "Horizon", label_y= "Forecasted Var", dbreak = NULL, date_format = "%b-%d-%Y")
+                     forcat_band = "darkorange", forcat_line = "darkorange", hist_line = "gray43", label_x = "Horizon", label_y= "Forecasted Var", dbreak = NULL, date_format = "%b-%d-%Y")
 {
-  all_data <- data.frame("x_all" = c(x_hist, x_forcat), "y_all" = c(y_hist, y_forcat))
-  forcat_data <- data.frame("x_forcat" = x_forcat, "y_forcat" = y_forcat)
+  all_data <- data.frame(x_all = c(x_hist, x_forcat), y_all = c(y_hist, y_forcat))
+  forcat_data <- data.frame(x_forcat = x_forcat, y_forcat = y_forcat)
 
   if(!is.null(lower) & !is.null(upper)){forcat_data$lower <- lower; forcat_data$upper <- upper}
 
-  plot <- ggplot()+geom_line(data = all_data, aes(x = x_all, y = y_all), color = hist_line, size = line_size)
-  if(!is.null(lower) & !is.null(upper)){plot <- plot + geom_ribbon(data = forcat_data, aes(x = x_forcat, ymin = lower, ymax = upper), alpha = 0.3, fill = forcat_band)}
+  plot <- ggplot()+geom_line(data = all_data, aes_string(x = "x_all", y = "y_all"), color = hist_line, size = line_size)
+  if(!is.null(lower) & !is.null(upper)){plot <- plot + geom_ribbon(data = forcat_data, aes(x = x_forcat, ymin = lower, ymax = upper), alpha = 3, fill = forcat_band)}
   plot <- plot + geom_line(data = forcat_data, aes(x = x_forcat, y = y_forcat), color = forcat_line, size = line_size)
   if(!is.null(dbreak)){plot <- plot + scale_x_date(name = paste0("\n", label_x), date_breaks = dbreak, date_labels = date_format)}
   if(is.null(dbreak)){plot <- plot + xlab(label_x)}
-  plot <- plot + scale_y_continuous(name = paste0(label_y, "\n"), labels = scales::number)
+  plot <- plot + scale_y_continuous(name = paste0(label_y, "\n"), labels = number)
   plot <- plot + ylab(label_y)  + theme_bw()
   plot <- plot + theme(axis.text=element_text(size=label_size), axis.title=element_text(size=label_size + 2))
 
   return(plot)
 }
 
-xgb_ts <- function(data, target_label, regressors_labels, past, nrounds, patience, internal_holdout = 0.5, booster,
-                   max_depth, eta, gamma, min_child_weight, subsample, colsample_bytree, lambda, alpha,
-                   verbose, reg, eval_metric)
+recursive_diff <- function(vector, deriv)
 {
-  if(!is.data.frame(data) | !is.matrix(data)){data <- data.frame(data)}
-  if(!all(c(target_label, regressors_labels) %in% colnames(data))){stop("missing target and/or regressors")}
+  vector <- unlist(vector)
+  head_value <- vector("numeric", deriv)
+  tail_value <- vector("numeric", deriv)
+  if(deriv==0){head_value = NULL; tail_value = NULL}
+  if(deriv > 0){for(i in 1:deriv){head_value[i] <- head(vector, 1); tail_value[i] <- tail(vector, 1); vector <- diff(vector)}}
+  outcome <- list(vector = vector, head_value = head_value, tail_value = tail_value)
+  return(outcome)
+}
 
-  target_regressors_ts <- data[,c(target_label, regressors_labels),drop=FALSE]
+invdiff <- function(vector, heads, add = FALSE)
+{
+  vector <- unlist(vector)
+  if(is.null(heads)){return(vector)}
+  for(d in length(heads):1){vector <- cumsum(c(heads[d], vector))}
+  if(add == FALSE){return(vector[-c(1:length(heads))])} else {return(vector)}
+}
 
-  reg <- paste0("reg:", reg)
 
-  if(booster=="gbtree")
-  {
-    param <- list(booster = booster, max_depth = max_depth, eta = eta,
-                  gamma = gamma, min_child_weight = min_child_weight, subsample = subsample, colsample_bytree = colsample_bytree,
-                  objective = reg, eval_metric = eval_metric)
+smart_head <- function(x, n)
+{
+  if(n != 0){return(head(x, n))}
+  if(n == 0){return(x)}
+}
+
+smart_tail <- function(x, n)
+{
+  if(n != 0){return(tail(x, n))}
+  if(n == 0){return(x)}
+}
+
+
+###
+upside_probability <- function(m)
+{
+  matrix <- t(as.matrix(m))
+  n <- nrow(matrix)
+  if(n == 1){return(c("avg_upside_prob" = NA, "terminal_upside_prob" = NA))}
+  growths <- matrix[-1,]/matrix[-n,] - 1
+  if(is.matrix(growths)){avg_upp <- round(mean(apply(growths, 1, function(x) mean(x[is.finite(x)] > 0, na.omit = TRUE)), na.omit = TRUE), 3)}
+  if(!is.matrix(growths)){avg_upp <- round(mean(growths[is.finite(growths)] > 0, na.omit = TRUE), 3)}
+  terminal_growth <- matrix[n,]/matrix[1,] - 1
+  last_to_first_upp <- round(mean(terminal_growth[is.finite(terminal_growth)] > 0, na.omit = TRUE), 3)
+  upp_stats <- c(avg_upp, last_to_first_upp)
+  names(upp_stats) <- c("avg_upside_prob", "terminal_upside_prob")
+  return(upp_stats)
+}
+
+
+##########
+sequential_divergence <- function(m)
+{
+  matrix <- t(as.matrix(m))
+  n <- nrow(matrix)
+  s <- seq(min(matrix), max(matrix), length.out = 100)
+  if(n == 1){return(c("max_divergence" = NA, "terminal_divergence" = NA))}
+  dens <- apply(matrix, 1, ecdf, simplify = FALSE)
+  backward <- dens[-n]
+  forward <- dens[-1]
+  seq_div <- map2_dbl(forward, backward, ~ abs(max(.x(s) - .y(s))))
+  avg_seq_div <- round(mean(seq_div), 3)
+  end_to_end_div <- abs(max(dens[[n]](s) - dens[[1]](s)))
+  div_stats <- c(avg_seq_div, end_to_end_div)
+  names(div_stats) <- c("max_divergence", "terminal_divergence")
+  return(div_stats)
+}
+
+###
+
+bayesian_search <- function(n_sample = 10, n_search = 5, booster, data, seq_len = NULL , deriv, norm = NULL, n_dim = NULL, ci = 0.8, min_set = 30,
+                            max_depth = NULL, eta = NULL, gamma = NULL, min_child_weight = NULL, subsample = NULL, colsample_bytree = NULL, lambda = NULL, alpha = NULL,
+                            n_windows = 3, patience = 0.1, nrounds = 100, dates = NULL, acq = "ucb", kappa = 2.576, eps = 0, kernel = list(type = "exponential", power = 2))
+{
+
+  n_obs <- nrow(data)
+  n_feats <- ncol(data)
+
+  if(booster == "gbtree"){
+
+    sl_boundaries <- NULL
+    norm_boundaries <- NULL
+    dim_boundaries <- NULL
+    depth_boundaries <- NULL
+    eta_boundaries <- NULL
+    gamma_boundaries <- NULL
+    mcw_boundaries <- NULL
+    ss_boundaries <- NULL
+    csbt_boundaries <- NULL
+    tuning_index <- rep(TRUE, 9)
+
+    if(is.null(seq_len)){sl_boundaries <- c(max(deriv)+1, n_obs/3)} else {ifelse(length(seq_len) > 1, sl_boundaries <- seq_len, tuning_index[1] <- FALSE)}
+    if(is.null(norm)){norm_boundaries <- c(FALSE, TRUE)} else {tuning_index[2] <- FALSE}
+    if(is.null(n_dim)){dim_boundaries <- c(1, n_feats)} else {ifelse(length(n_dim) > 1, dim_boundaries <- n_dim, tuning_index[3] <- FALSE)}
+    if(is.null(max_depth)){depth_boundaries <- c(1, 8)} else {ifelse(length(max_depth) > 1, depth_boundaries <- max_depth, tuning_index[4] <- FALSE)}
+    if(is.null(eta)){eta_boundaries <- c(0, 1)} else {ifelse(length(eta) > 1, eta_boundaries <- eta, tuning_index[5] <- FALSE)}
+    if(is.null(gamma)){gamma_boundaries <- c(0, 100)} else {ifelse(length(gamma) > 1, gamma_boundaries <- gamma, tuning_index[6] <- FALSE)}
+    if(is.null(min_child_weight)){mcw_boundaries <- c(0, 100)} else {ifelse(length(min_child_weight) > 1, mcw_boundaries <- min_child_weight, tuning_index[7] <- FALSE)}
+    if(is.null(subsample)){ss_boundaries <- c(0, 1)} else {ifelse(length(subsample) > 1, ss_boundaries <- subsample, tuning_index[8] <- FALSE)}
+    if(is.null(colsample_bytree)){csbt_boundaries <- c(0, 1)} else {ifelse(length(colsample_bytree) > 1, csbt_boundaries <- colsample_bytree, tuning_index[9] <- FALSE)}
+    tuned_params <- list(seq_len = as.integer(sl_boundaries), norm = as.integer(norm_boundaries), n_dim = as.integer(dim_boundaries), max_depth = as.integer(depth_boundaries), eta = eta_boundaries, gamma = gamma_boundaries, min_child_weight = mcw_boundaries, subsample = ss_boundaries, colsample_bytree = csbt_boundaries)[tuning_index]
   }
 
-  if(booster=="gblinear")
-  {
-    param <- list(booster = booster, eta = eta, lambda = lambda, alpha = alpha,
-                  objective = reg, eval_metric = eval_metric)
+
+  if(booster == "gblinear"){
+
+    sl_boundaries <- NULL
+    norm_boundaries <- NULL
+    dim_boundaries <- NULL
+    eta_boundaries <- NULL
+    lambda_boundaries <- NULL
+    alpha_boundaries <- NULL
+    tuning_index <- rep(TRUE, 6)
+
+    if(is.null(seq_len)){sl_boundaries <- c(max(deriv)+1, n_obs/3)} else {ifelse(length(seq_len) > 1, sl_boundaries <- seq_len, tuning_index[1] <- FALSE)}
+    if(is.null(norm)){norm_boundaries <- c(FALSE, TRUE)} else {tuning_index[2] <- FALSE}
+    if(is.null(n_dim)){dim_boundaries <- c(1, n_feats)} else {ifelse(length(n_dim) > 1, dim_boundaries <- n_dim, tuning_index[3] <- FALSE)}
+    if(is.null(eta)){eta_boundaries <- c(0, 1)} else {ifelse(length(eta) > 1, eta_boundaries <- eta, tuning_index[4] <- FALSE)}
+    if(is.null(lambda)){lambda_boundaries <- c(0, 100)} else {ifelse(length(lambda) > 1, lambda_boundaries <- lambda, tuning_index[5] <- FALSE)}
+    if(is.null(alpha)){alpha_boundaries <- c(0, 100)} else {ifelse(length(alpha) > 1, alpha_boundaries <- alpha, tuning_index[6] <- FALSE)}
+    tuned_params <- list(seq_len = as.integer(sl_boundaries), norm = as.integer(norm_boundaries), n_dim = as.integer(dim_boundaries), eta = eta_boundaries, lambda = lambda_boundaries, alpha = alpha_boundaries)[tuning_index]
   }
 
-  target_regressors_reframed <- narray::split(reframe(target_regressors_ts, past + 1), along = 3)
-  reframed <- Reduce(cbind, target_regressors_reframed)
 
-  if(!is.null(regressors_labels))
-  {
-    discard_index <- seq(past + 1, ncol(reframed), past + 1)[-1]
-    reframed <- reframed[, - discard_index, drop = FALSE]
+  make_alist <- function(args) {
+    res <- replicate(length(args), substitute())
+    names(res) <- args
+    res}
+
+  make_function <- function(args, body, env = parent.frame()) {
+    args <- as.pairlist(args)
+    eval(call("function", args, body), env)}
+
+  if(booster == "gbtree"){
+    body <- quote(
+      {model <- hood(data, seq_len , deriv, norm, n_dim, ci, min_set, booster = "gbtree",
+                     max_depth, eta, gamma, min_child_weight, subsample, colsample_bytree,
+                     lambda = NULL, alpha = NULL, n_windows, patience, nrounds, dates)
+
+      error <- mean(model$joint_error[2, c("max_rmse", "max_mae", "max_mdae")])
+
+      return(list(Score = -error, Pred = model))})}
+
+  if(booster == "gblinear"){
+    body <- quote(
+      {model <- hood(data, seq_len, deriv, norm, n_dim, ci, min_set, booster = "gblinear",
+                     max_depth = NULL, eta, gamma = NULL, min_child_weight = NULL, subsample = NULL, colsample_bytree = NULL,
+                     lambda, alpha, n_windows, patience, nrounds, dates)
+
+      error <- mean(model$joint_error[2, 1:3])
+
+      return(list(Score = -error, Pred = model))})}
+
+  args <- make_alist(names(tuned_params))
+  wrapper <- make_function(args, body)
+
+  bop <- BayesianOptimization(wrapper, bounds = tuned_params, init_points = n_sample, n_iter = n_search, acq = acq, kappa = kappa, eps = eps, kernel = kernel, verbose = FALSE)
+
+  errors <- round(Reduce(rbind, map(bop$Pred, ~ .x[[2]][2,])), 3)
+  weights <- apply(errors, 2, function(x) {abs(sd(x[is.finite(x)], na.rm = TRUE)/mean(x[is.finite(x)], na.rm = TRUE))})
+  finite_w <- is.finite(weights)
+  wgt_avg_rank <- round(apply(apply(abs(errors[, finite_w, drop = FALSE]), 2, rank), 1, weighted.mean, w = weights[finite_w]), 2)
+
+  history <- round(as.data.frame(bop$History), 3)
+  history <- cbind(history[, - c(1, ncol(history))], errors, wgt_avg_rank)
+  history$norm <- as.logical( history$norm)
+  rownames(history) <- NULL
+  models <- as.list(bop$Pred)
+  models <- map(models, ~ {names(.x) <- c("predictions", "joint_error", "serie_errors", "pred_stats", "plots"); return(.x)})
+
+  outcome <- list(history = history, models = models)
+  return(outcome)
+
+}
+
+#########
+random_search <- function(n_sample, data, booster = "gbtree", seq_len = NULL, deriv, norm = NULL, n_dim = NULL, ci = 0.8, min_set = 30,
+                          max_depth = NULL, eta = NULL, gamma = NULL, min_child_weight = NULL, subsample = NULL,
+                          colsample_bytree = NULL, lambda = NULL, alpha = NULL, n_windows = 3, patience = 0.1, nrounds = 100, dates = NULL, seed = 42)
+{
+  set.seed(seed)
+  n_obs <- nrow(data)
+  n_feats <- ncol(data)
+
+  if(is.null(seq_len)){sl_set <- sample(n_obs/3, n_sample, replace = TRUE)} else {ifelse(length(seq_len) > 1, sl_set <- sample(seq_len, n_sample, replace = TRUE), sl_set <- rep(seq_len, n_sample))}
+  sl_set[sl_set <= max(deriv)] <- max(deriv) + 1
+  if(is.null(norm)){norm_set <- sample(c(TRUE, FALSE), n_sample, replace = TRUE)} else {norm_set <- rep(norm, n_sample)}
+  if(is.null(n_dim)){dim_set <- sample(n_feats, n_sample, replace = TRUE)} else {ifelse(length(n_dim) > 1, dim_set <- sample(n_dim, n_sample, replace = TRUE), dim_set <- rep(n_dim, n_sample))}
+  dim_set[dim_set > n_feats] <- n_feats
+
+  if(booster == "gbtree"){
+    if(is.null(max_depth)){depth_set <- sample(8, n_sample, replace = TRUE)} else {ifelse(length(max_depth) > 1, depth_set <- sample(max_depth, n_sample, replace = TRUE), depth_set <- rep(max_depth, n_sample))}
+    if(is.null(eta)){eta_set <- runif(n_sample)} else {ifelse(length(eta) > 1, eta_set <- sample(eta, n_sample, replace = TRUE), eta_set <- rep(eta, n_sample))}
+    if(is.null(gamma)){gamma_set <- runif(n_sample, 0, 100)} else {ifelse(length(gamma) > 1, gamma_set <- sample(gamma, n_sample, replace = TRUE), gamma_set <- rep(gamma, n_sample))}
+    if(is.null(min_child_weight)){mcw_set <- sample(100, n_sample, replace = TRUE)} else {ifelse(length(min_child_weight) > 1, mcw_set <- sample(min_child_weight, n_sample, replace = TRUE), mcw_set <- rep(min_child_weight, n_sample))}
+    if(is.null(subsample)){ss_set <- runif(n_sample)} else {ifelse(length(subsample) > 1, ss_set <- sample(subsample, n_sample, replace = TRUE), ss_set <- rep(subsample, n_sample))}
+    if(is.null(colsample_bytree)){csbt_set <- runif(n_sample)} else {ifelse(length(colsample_bytree) > 1, csbt_set <- sample(colsample_bytree, n_sample, replace = TRUE), csbt_set <- rep(colsample_bytree, n_sample))}
+    hyper_params <- list(sl_set, norm_set, dim_set, depth_set, eta_set, gamma_set, mcw_set, ss_set, csbt_set)
+
+    exploration <- pmap(hyper_params, ~ tryCatch(hood(data, seq_len = ..1, deriv, norm = ..2, n_dim = ..3, ci, min_set, booster,
+                                                             max_depth = ..4, eta = ..5, gamma = ..6, min_child_weight = ..7, subsample = ..8,
+                                                             colsample_bytree = ..9, lambda = NULL, alpha = NULL, n_windows, patience, nrounds, dates), error = function(e) NA))
   }
 
-  train_index <- 1:round(nrow(reframed)*internal_holdout)
-  valid_index <- setdiff(1:nrow(reframed), train_index)
+  if(booster == "gblinear"){
+    if(is.null(eta)){eta_set <- runif(n_sample)} else {ifelse(length(eta) > 1, eta_set <- sample(eta, n_sample, replace = TRUE), eta_set <- rep(eta, n_sample))}
+    if(is.null(lambda)){lambda_set <- runif(n_sample, 0, 100)} else {ifelse(length(lambda) > 1, lambda_set <- sample(lambda, n_sample, replace = TRUE), lambda_set <- rep(lambda, n_sample))}
+    if(is.null(alpha)){alpha_set <- runif(n_sample, 0, 100)} else {ifelse(length(alpha) > 1, alpha_set <- sample(alpha, n_sample, replace = TRUE), alpha_set <- rep(alpha, n_sample))}
+    hyper_params <- list(sl_set, norm_set, dim_set, eta_set, lambda_set, alpha_set)
 
-  dtrain <- xgb.DMatrix(reframed[train_index,,drop=FALSE], label = reframed[train_index, past+1])
-  dval <- xgb.DMatrix(reframed[valid_index,,drop=FALSE], label = reframed[valid_index, past+1])
-  watchlist <- list(train = dtrain, eval = dval)
-
-  final_model <- xgb.train(param, dtrain, watchlist = watchlist, nrounds = nrounds, early_stopping_rounds = patience, verbose = verbose)
-
-  pred_fun <- function(new_data)
-  {
-    if(!is.data.frame(new_data) | !is.matrix(new_data)){new_data <- data.frame(new_data)}
-    new_data <- tail(new_data, past)
-    new_target_regressors_ts <- new_data[, c(target_label, regressors_labels), drop=FALSE]
-    new_target_regressors_ts <- Reduce(c, narray::split(new_target_regressors_ts, along = 2))
-    dim(new_target_regressors_ts) <- c(1, past * length(c(target_label, regressors_labels)))
-    prediction <- predict(final_model, new_target_regressors_ts)
-    return(prediction)
+    exploration <- pmap(hyper_params, ~ tryCatch(hood(data, seq_len = ..1, deriv, norm = ..2, n_dim = ..3, ci, min_set, booster,
+                                                             max_depth = NULL, eta = ..4, gamma = NULL, min_child_weight = NULL, subsample = NULL,
+                                                             colsample_bytree = NULL, lambda = ..5, alpha = ..6, n_windows, patience, nrounds, dates), error = function(e) NA))
   }
 
-  outcome <- list(pred_fun = pred_fun)
+  not_na <- !is.na(exploration)
+  exploration <- exploration[not_na]
+
+  if(n_sample == 1){
+    history <- t(Reduce(rbind, map(exploration, ~ .x$joint_error[2,])))
+    wgt_avg_rank <- 1}
+
+  if(n_sample > 1){
+    history <- Reduce(rbind, map(exploration, ~ .x$joint_error[2,]))
+    rownames(history) <- NULL
+    weights <- apply(history, 2, function(x) {abs(sd(x[is.finite(x)], na.rm = TRUE)/mean(x[is.finite(x)], na.rm = TRUE))})
+    finite_w <- is.finite(weights)
+    wgt_avg_rank <- round(apply(apply(abs(history[, finite_w, drop = FALSE]), 2, rank), 1, weighted.mean, w = weights[finite_w]), 2)}
+
+  if(booster == "gbtree"){history <- cbind(data.frame(seq_len = sl_set[not_na], norm = norm_set[not_na], n_dim = dim_set[not_na], max_depth = depth_set[not_na], eta = round(eta_set[not_na], 2), gamma = round(gamma_set[not_na], 2), min_child_weight = mcw_set[not_na], subsample = round(ss_set[not_na], 4), colsample_bytree = round(csbt_set[not_na], 4)), round(history, 3), wgt_avg_rank)}
+  if(booster == "gblinear"){history <- cbind(data.frame(seq_len = sl_set[not_na], norm = norm_set[not_na], n_dim = dim_set[not_na], eta = round(eta_set[not_na], 2), lambda = round(lambda_set[not_na], 2), alpha = round(alpha_set[not_na], 2)), round(history, 3), wgt_avg_rank)}
+
+  outcome <- list(history = history, models = exploration)
+}
+
+
+optimized_yjt <- function(vector, precision = 100)
+{
+
+  yjt_fun <- function(x, lambda = 0.5)
+  {
+    yjt <- vector(mode = "numeric", length = length(x))
+
+    for(i in 1:length(x))
+    {
+      if(x[i] >= 0 & lambda != 0){yjt[i] <- ((x[i]+1)^lambda - 1)/lambda}
+      if(x[i] >= 0 & lambda == 0){yjt[i] <- log(x[i]+1)}
+      if(x[i] < 0 & lambda != 2){yjt[i] <- -((-x[i]+1)^(2 - lambda) - 1)/(2 - lambda)}
+      if(x[i] < 0 & lambda == 2){yjt[i] <- -log(-x[i]+1)}
+    }
+    return(yjt)
+  }
+
+
+  inv_yjt <- function(x, lambda = 0.5)
+  {
+    inv_yjt <- vector(mode = "numeric", length = length(x))
+
+    for(i in 1:length(x))
+    {
+      if(x[i] >= 0 & lambda != 0){inv_yjt[i] <- exp(log(x[i] * lambda + 1)/lambda) - 1}
+      if(x[i] >= 0 & lambda == 0){inv_yjt[i] <- exp(x[i]) - 1}
+      if(x[i] < 0 & lambda != 2){inv_yjt[i] <- 1 - exp(log(1 - x[i]*(2 - lambda))/(2 - lambda))}
+      if(x[i] < 0 & lambda == 2){inv_yjt[i] <- 1 - exp(-x[i])}
+    }
+
+    return(inv_yjt)
+  }
+
+  lambda_seq <- seq(0, 2, length.out = precision)
+  cor_seq <- map_dbl(lambda_seq, ~ cor(yjt_fun(vector, .x), vector))
+  best_lambda <- lambda_seq[which.max(cor_seq)]
+
+  transformed <- yjt_fun(vector, best_lambda)
+  direct_fun <- function(x){yjt_fun(x, best_lambda)}
+  inverse_fun <- function(x){inv_yjt(x, best_lambda)}
+
+  outcome <- list(transformed = transformed, best_lambda = best_lambda, direct_fun = direct_fun, inverse_fun = inverse_fun)
   return(outcome)
 }
 
 
-xgb_forecast <- function(data, targets, past, future, deriv, ci, n_windows, internal_holdout, nrounds, patience,
-                         booster, max_depth, eta, gamma, min_child_weight, subsample, colsample_bytree, lambda, alpha,
-                         verbose, reg, eval_metric, starting_date, time_unit, dbreak, minmax_model, orig, all_positive_check, all_negative_check)
+best_deriv <- function(ts, max_diff = 3, thresh = 0.001)
 {
-  tic.clearlog()
-  tic("time")
+  pvalues <- vector(mode = "double", length = as.integer(max_diff))
 
-  data <- data[, targets, drop = FALSE]
-
-  n_feat <- ncol(data)
-  n_length <- nrow(data)
-
-  window_index <- sort(c(rep(1, n_length%%n_windows), rep(1:n_windows, floor(n_length/n_windows))))
-
-  ###TRAIN-TEST MODEL
-  training_error_in_window <- vector("list", n_windows)
-  testing_error_in_window <- vector("list", n_windows - 1)###THE LAST ONE TESTING IS THE PREDICTION ON NEW DATA
-  raw_error_samples_in_window <- vector("list", n_windows - 1)
-
-
-  for(w in 1:n_windows)
+  for(d in 1:(max_diff + 1))
   {
-    train_index <- c(1:n_length)[window_index <= w]
-    train_length <- length(train_index)
-    if(w != n_windows){test_index <- c(1:n_length)[window_index == w+1]; test_length <- length(test_index)}
-
-    train_data <- data[train_index,,drop=FALSE]
-    if(w != n_windows){test_data <- data[test_index,,drop=FALSE]}
-
-    train_diff_models <- map2(train_data, deriv, ~ recursive_diff(.x, .y))
-    train_data <- as.data.frame(lapply(map(train_diff_models, ~.x[[1]]), tail, n = train_length - max(deriv)))
-    #train_diff_models <- purrr::map(train_data, ~ recursive_diff(.x, deriv))
-    #train_data <- as.data.frame(purrr::map(train_diff_models, ~ .x[[1]]))
-
-    if(w != n_windows)
-    {
-      test_diff_models <- map2(test_data, deriv, ~ recursive_diff(.x, .y))
-      test_data <- as.data.frame(lapply(map(test_diff_models, ~.x[[1]]), tail, n = test_length - max(deriv)))
-    }
-
-    ts_models <- purrr::map(targets, ~ xgb_ts(train_data, target_label = .x, regressors_labels = if(n_feat == 1){NULL} else {setdiff(targets, .x)},
-                                              past - max(deriv), nrounds, patience, internal_holdout, booster, max_depth, eta, gamma, min_child_weight, subsample, colsample_bytree, lambda, alpha,
-                                              verbose, reg, eval_metric))
-
-    ###PREDICTION SEEDS
-    pred_funs <- purrr::map(ts_models, ~ .x$pred_fun)
-
-    step_fun <- function(new_data, future)
-    {
-      for(n in 1:future){new_data <- rbind(new_data, purrr::map_dbl(pred_funs, ~ .x(new_data)))}
-      return(as.data.frame(tail(new_data, future)))
-    }
-
-    if(w == n_windows)
-    {
-      new_data <- tail(train_data, past)###NEW DATA COMES FROM THE TAIL OF TRAIN SET IN THE NEW WINDOWED VALIDATION CYCLE
-      predictions <- narray::split(step_fun(new_data, future = future), along = 2)
-
-      tails <- purrr::map(train_diff_models, ~ .x[[3]])
-      predictions <- purrr::map2(predictions, tails, ~ tail(invdiff(.x, .y), future))
-
-      if(!is.null(minmax_model)){predictions <- map2(predictions, narray::split(minmax_model$params, along = 2), ~ unlist(minmax(.x, .y, inverse = TRUE, by_col = FALSE)))}
-    }
-
-    ###TRAIN ERROR ESTIMATION
-    training_error <- NULL
-
-    train_ground <- head(train_index, -(past + future - 1))
-    ts_sequence_error <- vector("list", length=length(train_ground))
-    one_step_error <- vector("list", length=length(train_ground))
-
-    for(i in 1:length(train_ground))
-    {
-      sample_ground <- data[train_ground[i]:(train_ground[i] + past - 1),,drop=FALSE]
-      sample_step <- data[(train_ground[i] + past):(train_ground[i] + past + future - 1),,drop=FALSE]
-
-      sample_diff_models <- map2(sample_ground, deriv, ~ recursive_diff(.x, .y))
-      sample_ground <- as.data.frame(lapply(map(sample_diff_models, ~.x[[1]]), tail, n = nrow(sample_ground) - max(deriv)))
-
-      sample_pred <- step_fun(sample_ground, future)
-
-      sample_tails <- purrr::map(sample_diff_models, ~ .x[[3]])
-      sample_pred <- as.data.frame(purrr::map2(sample_pred, sample_tails, ~ tail(invdiff(.x, .y), future)))
-
-      sample_step <- narray::split(sample_step, along = 2)
-      sample_pred <- narray::split(sample_pred, along = 2)
-
-      ############################BACKTRANSF
-      if(!is.null(minmax_model))
-      {
-        sample_step <- map2(sample_step, narray::split(minmax_model$params, along = 2), ~ unlist(minmax(.x, .y, inverse = TRUE, by_col = FALSE)))
-        sample_pred <- map2(sample_pred, narray::split(minmax_model$params, along = 2), ~ unlist(minmax(.x, .y, inverse = TRUE, by_col = FALSE)))
-      }
-
-      one_step_error[[i]] <- map2(sample_step, sample_pred, ~ eval_metrics(.x[1], .y[1]))
-      ts_sequence_error[[i]] <- map2(sample_step, sample_pred, ~ eval_metrics(.x, .y))
-    }
-
-    ts_sequence_error <- purrr::transpose(ts_sequence_error)
-    ts_sequence_error <- purrr::map(ts_sequence_error, ~Reduce(rbind, .x))
-    ts_sequence_error <- purrr::map(ts_sequence_error, ~ apply(.x, 2, mean))
-
-    one_step_error <- purrr::transpose(one_step_error)
-    one_step_error <- purrr::map(one_step_error, ~Reduce(rbind, .x))
-    one_step_error <- purrr::map(one_step_error, ~ apply(.x, 2, mean))
-
-    training_error <- purrr::transpose(list(one_step_error = one_step_error, ts_sequence_error = ts_sequence_error))
-    training_error <- purrr::map(training_error, ~ Reduce(rbind, .x))
-    training_error <- purrr::map(training_error, ~ {rownames(.x) <- c("one_step_error", "sequence_error"); return(.x)})
-    training_error_in_window[[w]] <- training_error
-
-    ###TEST ERROR ESTIMATION
-    if(w != n_windows){
-      test_ground <- head(test_index, -(past + future - 1))
-      raw_error_samples <- vector("list", length=length(test_ground))
-      ts_sequence_error <- vector("list", length=length(test_ground))
-      one_step_error <- vector("list", length=length(test_ground))
-
-      for(i in 1:length(test_ground))
-      {
-        sample_ground <- data[test_ground[i]:(test_ground[i] + past - 1),,drop=FALSE]
-        sample_step <- data[(test_ground[i] + past):(test_ground[i] + past + future - 1),,drop=FALSE]
-
-        sample_diff_models <- map2(sample_ground, deriv, ~ recursive_diff(.x, .y))
-        sample_ground <- as.data.frame(lapply(map(sample_diff_models, ~.x[[1]]), tail, n = nrow(sample_ground) - max(deriv)))
-
-        sample_pred <- step_fun(sample_ground, future)
-
-        sample_tails <- purrr::map(sample_diff_models, ~ .x[[3]])
-        sample_pred <- as.data.frame(purrr::map2(sample_pred, sample_tails, ~ tail(invdiff(.x, .y), future)))
-
-        sample_step <- narray::split(sample_step, along = 2)
-        sample_pred <- narray::split(sample_pred, along = 2)
-
-        ############################BACKTRANSF
-        if(!is.null(minmax_model))
-        {
-          sample_step <- map2(sample_step, narray::split(minmax_model$params, along = 2), ~ unlist(minmax(.x, .y, inverse = TRUE, by_col = FALSE)))
-          sample_pred <- map2(sample_pred, narray::split(minmax_model$params, along = 2), ~ unlist(minmax(.x, .y, inverse = TRUE, by_col = FALSE)))
-        }
-
-        raw_error_samples[[i]] <- map2(sample_step, sample_pred, ~ .x -.y)
-        one_step_error[[i]] <- map2(sample_step, sample_pred, ~ eval_metrics(.x[1], .y[1]))
-        ts_sequence_error[[i]] <- map2(sample_step, sample_pred, ~ eval_metrics(.x, .y))
-      }
-
-      raw_error_samples <- purrr::transpose(raw_error_samples)
-      raw_error_samples <- purrr::map(raw_error_samples, ~Reduce(rbind, .x))
-      raw_error_samples_in_window[[w]] <- raw_error_samples
-
-      ts_sequence_error <- purrr::transpose(ts_sequence_error)
-      ts_sequence_error <- purrr::map(ts_sequence_error, ~Reduce(rbind, .x))
-      ts_sequence_error <- purrr::map(ts_sequence_error, ~ apply(.x, 2, mean))
-
-      one_step_error <- purrr::transpose(one_step_error)
-      one_step_error <- purrr::map(one_step_error, ~Reduce(rbind, .x))
-      one_step_error <- purrr::map(one_step_error, ~ apply(.x, 2, mean))
-
-      testing_error <- purrr::transpose(list(one_step_error = one_step_error, ts_sequence_error = ts_sequence_error))
-      testing_error <- purrr::map(testing_error, ~ Reduce(rbind, .x))
-      testing_error <- purrr::map(testing_error, ~ {rownames(.x) <- c("one_step_error", "sequence_error"); return(.x)})
-      testing_error_in_window[[w]] <- testing_error
-    }
+    model <- lm(ts ~ t, data.frame(ts, t = 1:length(ts)))
+    pvalues[d] <- with(summary(model), pf(fstatistic[1], fstatistic[2], fstatistic[3],lower.tail=FALSE))
+    ts <- diff(ts)
   }
 
-  ###ERROR INTEGRATION
-  training_error <- map(transpose(training_error_in_window[-n_windows]), ~ Reduce('+', .x)/(n_windows - 1))
-  testing_error <- map(transpose(testing_error_in_window), ~ Reduce('+', .x)/(n_windows - 1))
-  raw_error_samples <- map(transpose(raw_error_samples_in_window), ~ Reduce(rbind, .x))
+  best <- tail(cumsum(pvalues < thresh), 1)
 
-  quants <- sort(unique(c((1-ci)/2, 0.25, 0.5, 0.75, ci+(1-ci)/2)))
-  q_names <- paste0("q", quants * 100)
-  integrated_pred <- pmap(list(predictions, raw_error_samples), ~ t(mapply(function(t) ..1[t] + sample(..2[, t], size = 1000, replace = TRUE), t = 1:future)))
-
-  if(any(all_positive_check)){integrated_pred <- map_if(integrated_pred, all_positive_check, ~ {.x[.x < 0] <- 0; return(.x)})}
-  if(any(all_negative_check)){integrated_pred <- map_if(integrated_pred, all_negative_check, ~ {.x[.x > 0] <- 0; return(.x)})}
-
-  quantile_predictor <- as_mapper(~t(apply(.x, 1, function(x){round(c(min(x, na.rm = TRUE), quantile(x, probs = quants, na.rm = TRUE), max(x, na.rm = TRUE), mean(x, na.rm = TRUE), sd(x, na.rm = TRUE), suppressWarnings(mlv1(x, method = "shorth", na.rm = TRUE)), skewness(x, na.rm=TRUE), kurtosis(x, na.rm=TRUE)), 3)})))
-  predictions <- purrr::map(integrated_pred, quantile_predictor)
-  predictions <- purrr::map(predictions, ~ {rownames(.x) <- NULL; colnames(.x) <- c("min", q_names, "max", "mean", "sd", "mode", "skewness", "kurtosis"); return(.x)})
-  names(predictions) <- targets
-
-  ###PREDICTION STATISTICS
-  avg_iqr_to_range <- round(map_dbl(predictions, ~ mean((.x[,"q75"] - .x[,"q25"])/(.x[,"max"] - .x[,"min"]))), 3)
-  last_to_first_iqr <- round(map_dbl(predictions, ~ (.x[future,"q75"] - .x[future,"q25"])/(.x[1,"q75"] - .x[1,"q25"])), 3)
-  kld_stats <- as.data.frame(map(integrated_pred, ~ sequential_kld(.x)))
-  upp_stats <- as.data.frame(map(integrated_pred, ~ upside_probability(.x)))
-
-  pred_stats <- as.data.frame(rbind(avg_iqr_to_range, last_to_first_iqr, kld_stats, upp_stats))###WRAPPED AS DF TO AVOID TIBBLE WARNING IN FOLLOWING LINE
-  rownames(pred_stats) <- c("avg_iqr_to_range", "terminal_iqr_ratio", "avg_kl_divergence", "terminal_kl_divergence", "avg_upside_prob", "terminal_upside_prob")
-
-  ###SETTING DATES
-  if(lubridate::is.Date(starting_date) && !is.null(time_unit))
-  {
-    time_unit <- as.duration(time_unit)
-    ts_start_date <- starting_date
-    ts_end_date <- as.Date(ts_start_date + time_unit * n_length)
-    pred_start_date <- as.Date(ts_end_date + time_unit)
-    pred_end_date <- as.Date(pred_start_date + time_unit * future)
-
-    dates <- map(1:n_feat, ~ seq.Date(ts_start_date, ts_end_date, length.out = n_length))
-    pred_dates <- map(1:n_feat, ~ seq.Date(pred_start_date, pred_end_date, length.out = future))
-
-    predictions <- map2(predictions, pred_dates, ~ as.data.frame(cbind(dates=.y, .x)))
-    predictions <- map(predictions, ~ {.x$dates <- as.Date(.x$dates, origin = "1970-01-01"); return(.x)})
-  }
-
-  if(!lubridate::is.Date(starting_date) || is.null(time_unit))
-  {
-    dates <- 1:n_length
-    dates <- replicate(n_feat, dates, simplify = FALSE)
-    pred_dates <- (n_length+1):(n_length+future)
-    pred_dates <- replicate(n_feat, pred_dates, simplify = FALSE)
-  }
-
-  ###PREDICTION PLOT
-  lower_name <- paste0("q", ((1-ci)/2) * 100)
-  upper_name <- paste0("q", (ci+(1-ci)/2) * 100)
-
-  plot <- pmap(list(orig, predictions, targets, dates, pred_dates), ~ ts_graph(x_hist = ..4, y_hist = ..1, x_forcat = ..5, y_forcat = ..2[, "q50"],
-                                                                               lower = ..2[, lower_name], upper = ..2[, upper_name], label_x = paste0("Extreme Gradient Boosting Time Series Analysis (past = ", past ,", future = ", future,")"),
-                                                                               label_y = paste0(str_to_title(..3), " Values"), dbreak = dbreak))
-
-  toc(log = TRUE)
-  time_log<-seconds_to_period(round(parse_number(unlist(tic.log())), 0))
-
-  outcome <- list(training_error = training_error, testing_error = testing_error, predictions = predictions, pred_stats = pred_stats, integrated_pred = integrated_pred, plot = plot)
-  return(outcome)
+  return(best)
 }

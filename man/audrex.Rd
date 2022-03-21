@@ -8,17 +8,16 @@
 \usage{
 audrex(
   data,
-  targets,
-  past = NULL,
-  future = NULL,
-  deriv = 0,
-  smoother = F,
-  ci = 0.8,
-  windows = 3,
-  internal_holdout = 0.5,
-  nrounds = 100,
-  patience = 10,
+  n_sample = 10,
+  n_search = 5,
+  smoother = FALSE,
+  seq_len = NULL,
+  diff_threshold = 0.001,
   booster = "gbtree",
+  norm = NULL,
+  n_dim = NULL,
+  ci = 0.8,
+  min_set = 30,
   max_depth = NULL,
   eta = NULL,
   gamma = NULL,
@@ -27,86 +26,63 @@ audrex(
   colsample_bytree = NULL,
   lambda = NULL,
   alpha = NULL,
-  verbose = FALSE,
-  reg = "squarederror",
-  eval_metric = "rmse",
-  starting_date = NULL,
-  time_unit = NULL,
-  dbreak = NULL,
-  min_set = 30,
-  seed = 42,
-  opt_metric = "mae",
-  n_samp = 10,
-  n_search = 5,
+  n_windows = 3,
+  patience = 0.1,
+  nrounds = 100,
+  dates = NULL,
   acq = "ucb",
   kappa = 2.576,
   eps = 0,
   kernel = list(type = "exponential", power = 2),
-  minmax = FALSE
+  seed = 42
 )
 }
 \arguments{
-\item{data}{A data frame with time series on columns and possibly a date column (not mandatory)}
+\item{data}{A data frame with time features on columns.}
 
-\item{targets}{String. Names of ts features to be jointly analyzed: for each feature a distinct model is built using the others as regressors.}
+\item{n_sample}{Positive integer. Number of samples for the Bayesian Optimization. Default: 10.}
 
-\item{past}{Positive integer. The past dimension with number of time-steps in the past used for the prediction.}
-
-\item{future}{Positive integer. The future dimension with number of time-steps to be predicted}
-
-\item{deriv}{Positive integer. Number of differentiation operations to perform on the original series. 0 = no change; 1: one diff; 2: two diff, and so on.}
+\item{n_search}{Positive integer. Number of search steps for the Bayesian Optimization. When the parameter is set to 0, optimization is shifted to Random Search. Default: 5,}
 
 \item{smoother}{Logical. Perform optimal smoothing using standard loess. Default: FALSE}
 
-\item{ci}{Confidence interval. Default: 0.8}
+\item{seq_len}{Positive integer. Number of time-steps to be predicted. Default: NULL (automatic selection)}
 
-\item{windows}{Positive integer. Number of (expanding) windows for cross-validation. Default: 3.}
-
-\item{internal_holdout}{Positive numeric. Holdout percentage for internal xgb validation. Default: 0.5.}
-
-\item{nrounds}{Positive numeric. Number of round for the extreme boosting machine. Look to xgboost for description. Default: 100.}
-
-\item{patience}{Positive integer. Waiting rounds without improvement before xgboost stops. Default: 10}
+\item{diff_threshold}{Positive numeric. Minimum F-test threshold for differentiating each time feature (keep it low). Default: 0.001.}
 
 \item{booster}{String. Optimization methods available are: "gbtree", "gblinear". Default: "gbtree".}
 
-\item{max_depth}{Positive integer. Look to xgboost documentation for description. A vector with one or two positive integer for the search boundaries. The default value (NULL) sets automatically the values in c(1, 10).}
+\item{norm}{Logical. Boolean flag to apply Yeo-Johson normalization. Default: NULL (automatic selection from random search or bayesian search).}
 
-\item{eta}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric between (0, 1] for the search boundaries. The default value (NULL) sets automatically the values in c(0.001, 1).}
+\item{n_dim}{Positive integer. Projection of time features in a lower dimensional space with n_dim features. The default value (NULL) sets automatically the values in c(1, n features).}
 
-\item{gamma}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0.001, 100).}
-
-\item{min_child_weight}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(1, 100).}
-
-\item{subsample}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric between (0, 1] for the search boundaries. The default value (NULL) sets automatically the values in c(0.1, 1).}
-
-\item{colsample_bytree}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric between (0, 1] for the search boundaries. The default value (NULL) sets automatically the values in c(0.1, 1).}
-
-\item{lambda}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0.1, 100).}
-
-\item{alpha}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0.1, 100).}
-
-\item{verbose}{Logical. Default: TRUE}
-
-\item{reg}{String. Learning objective function. Options are: "squarederror", "pseudohubererror".Default: "squarederror".}
-
-\item{eval_metric}{String. Evaluation metric for the boosting algorithm. Options are: "rmse", "mae", "mape".Default: "mae".}
-
-\item{starting_date}{Date. Initial date to assign temporal values to the series. Default: NULL (progressive numbers).}
-
-\item{time_unit}{String. Time step of the features, in liberal form: i.e., "20 seconds", "10 week", "1 day". Default: NULL.}
-
-\item{dbreak}{String. Minimum time marker for the plot x-axis, in liberal form: i.e., "3 months", "1 week", "20 days". Default: NULL.}
+\item{ci}{Confidence interval. Default: 0.8.}
 
 \item{min_set}{Positive integer. Minimun number for validation set in case of automatic resize of past dimension. Default: 30.}
 
-\item{seed}{Random seed. Default: 42.}
+\item{max_depth}{Positive integer. Look to xgboost documentation for description. A vector with one or two positive integer for the search boundaries. The default value (NULL) sets automatically the values in c(1, 8).}
 
-\item{opt_metric}{String. Parameter for selecting the best model, averaging one-step error across all ts features. Default: "mae".}
+\item{eta}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric between (0, 1] for the search boundaries. The default value (NULL) sets automatically the values in c(0, 1).}
 
-\item{n_samp}{Positive integer. Number of samples for the Bayesian Optimization. Default: 10.}
+\item{gamma}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0, 100).}
 
-\item{n_search}{Positive integer. Number of search steps for the Bayesian Optimization. Default: 5.}
+\item{min_child_weight}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0, 100).}
+
+\item{subsample}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric between (0, 1] for the search boundaries. The default value (NULL) sets automatically the values in c(0, 1).}
+
+\item{colsample_bytree}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric between (0, 1] for the search boundaries. The default value (NULL) sets automatically the values in c(0, 1).}
+
+\item{lambda}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0, 100).}
+
+\item{alpha}{Positive numeric. Look to xgboost documentation for description. A vector with one or two positive numeric for the search boundaries. The default value (NULL) sets automatically the values in c(0, 100).}
+
+\item{n_windows}{Positive integer. Number of (expanding) windows for cross-validation. Default: 3.}
+
+\item{patience}{Positive numeric. Percentage of waiting rounds without improvement before xgboost stops. Default: 0.1}
+
+\item{nrounds}{Positive numeric. Number of round for the extreme boosting machine. Look to xgboost for description. Default: 100.}
+
+\item{dates}{Date. Vector of dates for the time series. Default: NULL (progressive numbers).}
 
 \item{acq}{String. Parameter for Bayesian Optimization. For reference see rBayesianOptimization documentation. Default: "ucb".}
 
@@ -116,28 +92,31 @@ audrex(
 
 \item{kernel}{List. Parameter for Bayesian Optimization. For reference see rBayesianOptimization documentation. Default: list(type = "exponential", power = 2).}
 
-\item{minmax}{Logical. Boolean flag to apply minmax normalization. Default: FALSE.}
+\item{seed}{Random seed. Default: 42.}
 }
 \value{
 This function returns a list including:
 \itemize{
-\item best_par: the parameter of the best model selected through Bayesian Optimization
-\item history: a table with the sampled models (n_samp + n_search), their parameters and optimization metric
-\item best_model: results for the best selected model, including:
+\item history: a table with the models from bayesian (n_sample + n_search) or random search (n_sample), their hyper-parameters and optimization metric, the weighted average rank
+\item models: a list with the details for each model in history
+\item best_model: results for the best selected model according to the weighted average rank, including:
 \itemize{
-\item errors: training and testing errors for one-step and sequence for each ts feature (rmse, mae, mdae, mpe, mape, smape)
-\item predictions: min, max, q25, q50, q75, quantiles at selected ci, mean, sd for each ts feature
-\item pred_stats: for each predicted time feature, IQR to range, Kullback-Leibler Divergence (compared to previous point in time), upside probability (compared to previous point in time), both averaged across all points in time and compared between the terminal and the first point in the prediction sequence.
+\item predictions: min, max, q25, q50, q75, quantile at selected ci, mean, sd, skewness and kurtosis for each time feature
+\item joint_error: max sequence error for the differentiated time features (max_rmse, max_mae, max_mdae, max_mape, max_mase, max_rae, max_rse, max_rrse, both for training and testing)
+\item serie_errors: sequence error for the differentiated time features averaged across testing windows (rmse, mae, mdae, mape, mase, rae, rse, rrse, both for training and testing)
+\item pred_stats: for each predicted time feature, IQR to range, divergence, risk ratio, upside probability, averaged across prediction time-points and at the terminal points
+\item plots: a plot for each predicted time feature with highlighted median and confidence intervals
 }
 \item time_log
 }
 }
 \description{
-Dynamic regression for time series using Extreme Gradient Boosting with hyper-parameter tuning via Bayesian Optimization.
+Dynamic regression for time series using Extreme Gradient Boosting with hyper-parameter tuning via Bayesian Optimization or Random Search.
 }
 \examples{
 \donttest{
-audrex(covid_in_europe, "daily_cases", past = 10, future = 5, deriv = 1, n_samp = 5, n_search = 3)
+audrex(covid_in_europe[, 2:5], n_samp = 3, n_search = 2, seq_len = 10) ### BAYESIAN OPTIMIZATION
+audrex(covid_in_europe[, 2:5], n_samp = 5, n_search = 0, seq_len = 10) ### RANDOM SEARCH
 }
 
 
