@@ -58,7 +58,7 @@
 #'@examples
 #'\donttest{
 #'audrex(covid_in_europe[, 2:5], n_samp = 3, n_search = 2, seq_len = 10) ### BAYESIAN OPTIMIZATION
-#'audrex(covid_in_europe[, 2:5], n_samp = 5, n_search = 0, seq_len = 10) ### RANDOM SEARCH WHEN n_search SET TO 0
+#'audrex(covid_in_europe[, 2:5], n_samp = 5, n_search = 0, seq_len = 10) ### RANDOM SEARCH
 #'}
 #'
 #'
@@ -69,6 +69,7 @@ audrex <- function(data, n_sample = 10, n_search = 5, smoother = FALSE, seq_len 
   tic.clearlog()
   tic("time")
 
+  if(ncol(data) < 2){n_dim <- 1; norm <- F}
   if(anyNA(data)){data <- as.data.frame(map(data, ~ na_kalman(.x))); message("kalman imputation on target and/or regressors\n")}
   if(smoother==TRUE){data <- as.data.frame(map(data, ~ suppressWarnings(loess.as(x=1:nrow(data), y=.x)$fitted))); message("performing optimal smoothing\n")}
 

@@ -1,12 +1,12 @@
-f544f2ac2aabe08cfe7de64d87f17ccd *DESCRIPTION
+00a87dc475bee4458f04699057b68504 *DESCRIPTION
 fc063de3f2661c5a5f68619190960abc *NAMESPACE
 c6d2087dbc6573b664341745a132441b *NEWS.md
 d3d5b6e4303f1a1dc2068dadecd7af6b *R/audrex.R
 9c07e911de0c56967b7023d8398d3776 *R/data1.R
 de3641060cc0ecf99738306396c87231 *R/data2.R
 ccb8029371efd0332b10646c9ccce43f *R/data3.R
-6ecb6b4a819dce1cc4dce16b5fc21c2e *R/main.R
-931d2ba98fb4b1585b47848e9bb258c5 *R/support.R
+05468e59e6454da34d845da28e0ec055 *R/main.R
+0c12e96861ea2e796ab598d9850f07f2 *R/support.R
 f2387306b24f947136551821343cc7af *data/bitcoin_gold_oil.rda
 f97dec17c5ac1697c9bc817b479a9d03 *data/climate_anomalies.rda
 e7d0f156c6111115f4c6f4ea4343d7b8 *data/covid_in_europe.rda

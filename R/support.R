@@ -150,8 +150,7 @@ hood <- function(ts_set, seq_len, deriv, norm = TRUE, n_dim, ci = 0.8, min_set =
   feat_names <- colnames(ts_set)
 
   if(norm == TRUE){
-    ###minmax <- function(x){(x - min(x))/(diff(range(x)))}
-    ts_set <- as.data.frame(apply(ts_set, 2, function(x) optimized_yjt(x)$transformed))###NORMALIZATION
+       ts_set <- as.data.frame(apply(ts_set, 2, function(x) optimized_yjt(x)$transformed))###NORMALIZATION
   }
 
   n_feats <- ncol(ts_set)
@@ -163,8 +162,8 @@ hood <- function(ts_set, seq_len, deriv, norm = TRUE, n_dim, ci = 0.8, min_set =
 
   models <- pmap(list(targets, deriv, feat_names), ~ sequencer(seq_len, ts_set, ..1, ..2, ci, min_set, booster, max_depth, eta, gamma, min_child_weight, subsample, colsample_bytree, lambda, alpha, n_windows, patience, nrounds, ..3, dates))
   serie_errors <- map(models, ~ round(.x$seq_errors, 3))
-  max_train_error <- apply(Reduce(rbind, map(serie_errors, ~ .x[1,])), 2, max)
-  max_test_error <- apply(Reduce(rbind, map(serie_errors, ~ .x[2,])), 2, max)
+  if(n_feats > 1){max_train_error <- apply(Reduce(rbind, purrr::map(serie_errors, ~ .x[1,])), 2, max)} else {max_train_error <- matrix(serie_errors[[1]][1,], 1)}
+  if(n_feats > 1){max_test_error <- apply(Reduce(rbind, purrr::map(serie_errors, ~ .x[2,])), 2, max)} else {max_test_error <- matrix(serie_errors[[1]][2,], 1)}
   joint_error <- round(rbind(max_train_error, max_test_error), 3)
   rownames(joint_error) <- c("train", "test")
   colnames(joint_error) <- paste0("max_", c("rmse", "mae", "mdae", "mape", "mase", "rae", "rse", "rrse"))
@@ -271,7 +270,7 @@ sequential_divergence <- function(m)
   avg_seq_div <- round(mean(seq_div), 3)
   end_to_end_div <- abs(max(dens[[n]](s) - dens[[1]](s)))
   div_stats <- c(avg_seq_div, end_to_end_div)
-  names(div_stats) <- c("max_divergence", "terminal_divergence")
+  names(div_stats) <- c("avg_divergence", "terminal_divergence")
   return(div_stats)
 }
 
@@ -372,7 +371,7 @@ bayesian_search <- function(n_sample = 10, n_search = 5, booster, data, seq_len 
 
   history <- round(as.data.frame(bop$History), 3)
   history <- cbind(history[, - c(1, ncol(history))], errors, wgt_avg_rank)
-  history$norm <- as.logical( history$norm)
+  if(!is.null(history$norm)){history$norm <- as.logical(history$norm)}
   rownames(history) <- NULL
   models <- as.list(bop$Pred)
   models <- map(models, ~ {names(.x) <- c("predictions", "joint_error", "serie_errors", "pred_stats", "plots"); return(.x)})
