@@ -2,8 +2,8 @@
 % Please edit documentation in R/audrex.R, R/main.R
 \docType{package}
 \name{audrex}
-\alias{audrex}
 \alias{audrex-package}
+\alias{audrex}
 \title{audrex: Automatic Dynamic Regression using Extreme Gradient Boosting}
 \usage{
 audrex(
@@ -129,5 +129,8 @@ Useful links:
 
 }
 \author{
+\strong{Maintainer}: Giancarlo Vercellino \email{giancarlo.vercellino@gmail.com} [copyright holder]
+
+
 Giancarlo Vercellino \email{giancarlo.vercellino@gmail.com}
 }
